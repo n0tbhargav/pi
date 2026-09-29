@@ -1,0 +1,417 @@
+/**
+ * Shipped digest presets for pi-bgrun's opt-in digest scorecards.
+ *
+ * Pure data: each preset is a POSIX-sh command that receives the job's log
+ * path as `$1` and prints a short pass/fail scorecard. Every command ends in
+ * `head -N` so output is bounded no matter what the log contains. Presets are
+ * consumed via `resolveDigest()`; they only ever run for trust-gated projects
+ * that explicitly opted in via the `digest` config section (see
+ * extension/index.ts). Nothing here runs unless configured — no built-in
+ * pattern guessing.
+ */
+
+export interface DigestPreset {
+	id: string;
+	description: string;
+	command: string;
+	/**
+	 * Advisory only — the conventional job `type` this preset is meant for,
+	 * used by docs and the digest-config skill when scaffolding a config
+	 * (e.g. `{ "type": "test", "preset": "go-test" }`). It carries NO runtime
+	 * semantics: a preset entry never selects itself by type; the project's
+	 * config still declares the `type` on each entry.
+	 */
+	suggestedType: string;
+}
+
+// Bun's transpiler re-encodes non-ASCII inside String.raw templates as
+// `\uXXXX`; a raw string keeps that VERBATIM (backslash included), and awk drops
+// the backslash — so a literal "—" reaches awk as the five characters "u2014".
+// Interpolating these normal-string constants (which DO evaluate the escape)
+// keeps the raw template safe for regex backslashes while still handing awk real
+// UTF-8. Only the trace presets need non-ASCII.
+const TRACE_SEP = " — ";
+const TRACE_GLYPHS = "✗|✘|✖|×";
+
+export const DIGEST_PRESETS: DigestPreset[] = [
+	{
+		id: "go-test",
+		description: "Go test output: package ok/FAIL counts + failing test names",
+		suggestedType: "test",
+		// Count `^ok `/`^FAIL` package lines, then list `--- FAIL: TestX` names
+		// (duration suffix stripped). Ends in head.
+		command:
+			"printf 'pass: %s  fail: %s\\n' \"$(grep -c '^ok ' \"$1\")\" \"$(awk '/^FAIL\\t/ {n++} END {print n + 0}' \"$1\")\"; grep '^--- FAIL: ' \"$1\" | sed 's/^--- FAIL: //; s/ (.*//' | sort -u | head -10",
+	},
+	{
+		id: "jest",
+		description: "Jest output: Tests/Test Suites summary + failed test names",
+		suggestedType: "test",
+		// Jest prints `Tests:`/`Test Suites:` summary lines (with or without
+		// color) and marks individual failures with `●` (default reporter) or
+		// `✕`/`×` (verbose). Strip the leading bullet so names stay readable.
+		command:
+			'grep -E \'^(Test Suites|Tests):\' "$1"; grep -E \'●|✕|×\' "$1" | awk \'{sub(/^ *[^A-Za-z0-9]*/, ""); if ($0 != "") print}\' | sort -u | head -10',
+	},
+	{
+		id: "pytest",
+		description: "pytest output: final passed/failed/error summary line + FAILED test ids",
+		suggestedType: "test",
+		// The short summary line looks like `===== 2 failed, 3 passed in 0.5s ===`;
+		// with -rA/-rf each failure also gets a `FAILED tests/test_x.py::test_y` line.
+		command:
+			"grep -E '^=+ [0-9]+ (passed|failed|error)' \"$1\"; grep '^FAILED ' \"$1\" | awk '{print $2}' | sort -u | head -10",
+	},
+	{
+		id: "junit-xml",
+		description:
+			"JUnit XML: <failure>/<error> counts + failing testcase names, with file:line when the emitter carries one",
+		suggestedType: "test",
+		// Count failure/error elements (attributes like failures="0" don't match —
+		// they lack the `<`), then pull each failing testcase's name plus, when
+		// present, a `file`/`line` location. Real pytest --junitxml emits the whole
+		// document on ONE line, so the scan is record-based (`RS='<testcase'`, not
+		// line-based); it trims each record at `</testcase>` and matches
+		// `[[:space:]]name="` so it never picks up `classname="..."` nor a `<failure`
+		// from text after the element. `file`/`line` are searched over the whole
+		// record — emitters disagree on where they sit (pytest/PHPUnit put them on
+		// <testcase>, some put them on the failing element) and some carry neither
+		// (node:test emits `file` only; Go's gotestsum emits none), so the location
+		// is appended only when the emitted attribute exists and the name still
+		// prints alone otherwise.
+		command:
+			'printf \'failures: %s  errors: %s\\n\' "$(grep -o \'<failure\' "$1" | wc -l | tr -d \' \')" "$(grep -o \'<error\' "$1" | wc -l | tr -d \' \')"; awk -v RS=\'<testcase\' \'function attr(s,k, q,p){q="\\"";p="[[:space:]]"k"="q"[^"q"]*"q;return match(s,p)?substr(s,RSTART+length(k)+3,RLENGTH-length(k)-4):""} NR>1 { r=$0; e=index(r,"</testcase>"); if (e) r=substr(r,1,e-1); if (r ~ /<failure|<error/ && match(r,/[[:space:]]name="[^"]*"/)) { n=substr(r,RSTART+7,RLENGTH-8); f=attr(r,"file"); l=attr(r,"line"); print n (f!="" ? " (" f (l!="" ? ":" l : "") ")" : "") } }\' "$1" | sort -u | head -10',
+	},
+	{
+		id: "js-trace",
+		description:
+			"JS/TS, Go, Rust and JVM stack traces (innermost frame printed first): first failure signature + the deepest source frame, scanned forwards or backwards",
+		suggestedType: "test",
+		// One awk pass. (1) First signature line — V8/bun `(fail)`, node:test/ Jest
+		// `✗`/`✖`, go `--- FAIL`, cargo `FAILED`, `AssertionError`, JVM
+		// `Exception in thread`. A signature must be EVIDENCE of a failing test: the
+		// runner's `(fail)` / `--- FAIL` markers are line-leading records, so they are
+		// anchored (`^[[:space:]]*`) — a mid-line mention of "(fail)" in a test's
+		// printed name is not a failure. A line that is itself a pass record
+		// (`(pass) …`) is never a signature, whatever it contains: a passing test's
+		// name can carry "FAILED"/"AssertionError"/"(fail)" as text (a suite that
+		// prints captured failure logs does exactly this), and a wrong pointer costs
+		// more than none. With no genuine signature the preset prints nothing. (2) The
+		// first NON-runtime frame within a 60-line forward cap (runtime/internal
+		// frames — node:internal, /rustc/, Go's GOROOT
+		// src (…/go/src/ or …/libexec/src/), /library/std|core/ — are excluded by
+		// path, so the user frame wins
+		// over the stdlib one Go/Rust print first). (3) If none, the earliest frame of
+		// the contiguous run ABOVE the signature, because a V8 stack is printed
+		// above the `(fail)` line. The 60-line cap is where the old built-in
+		// FRAME_LOOKAHEAD lives on; the backward run is FRAME_LOOKBEHIND. Prints
+		// nothing when no signature is found.
+		command: String.raw`awk 'function trim(s){gsub(/^[ \t]+|[ \t]+$/,"",s);return s} function ex(l){return l ~ /node:internal|\/rustc\/|\/libexec\/src\/|\/go\/src\/|\/library\/(std|core)\/|\(node:/} function fr(l){ return !ex(l) && ( (l ~ /^[ \t]*at[ \t]+([^(]+[ \t]+\()?[^ \t()]+\.(ts|tsx|js|jsx|mjs|cjs|mts|cts|go|rs|java|kt|scala|swift|cs|c|h|cpp|php|lua):[0-9]+:[0-9]+\)?[ \t]*$/) || (l ~ /^[ \t]+[^ \t]+\.go:[0-9]+( \+0x[0-9a-f]+)?[ \t]*$/) || (l ~ /^[ \t]*at [^()]+\([^()]+\.(java|kt|scala):[0-9]+\)[ \t]*$/) ) } {L[NR]=$0} END{ for(i=1;i<=NR;i++) if((L[i] ~ /(^[[:space:]]*\(fail\)|${TRACE_GLYPHS}|^[[:space:]]*--- FAIL)|(^|[^[:alnum:]_])FAIL(ED|URE)?([^[:alnum:]_]|$)|AssertionError|Exception in thread/) && L[i] !~ /^[ \t]*\(pass\)/){f=i;break} if(!f)exit; for(j=f+1;j<=NR&&j<=f+60;j++) if(fr(L[j])){print "Failure: "trim(L[f])"${TRACE_SEP}"trim(L[j]);exit} s=f-1; while(s>=1&&fr(L[s]))s--; if(s+1<=f-1&&fr(L[s+1])){print "Failure: "trim(L[f])"${TRACE_SEP}"trim(L[s+1]);exit} print "Failure: "trim(L[f]) }' "$1" | head -1`,
+	},
+	{
+		id: "py-trace",
+		description:
+			'Python tracebacks (outermost frame printed first): first failure header + the LAST `File "…", line N, in fn` frame, which is the deepest — not the first',
+		suggestedType: "test",
+		// One awk pass. (1) First signature — unittest `FAIL:`/`ERROR:`, a bare
+		// `Traceback (most recent call last)`, pytest's `E AssertionError`, or a bare
+		// `AssertionError`. (2) Keep the LAST `File "…", line N, in fn` frame within
+		// the 60-line forward cap (Python prints outermost-first, so the deepest is
+		// the last of the run). (3) If the traceback sits ABOVE the header (pytest's
+		// E-line form), take the nearest `File` frame above it instead. Prints
+		// nothing when no signature is found.
+		command: String.raw`awk 'function trim(s){gsub(/^[ \t]+|[ \t]+$/,"",s);return s} function fr(l){return l ~ /^[ \t]*File "[^"]+", line [0-9]+, in /} {L[NR]=$0} END{ for(i=1;i<=NR;i++) if(L[i] ~ /(^|[^[:alnum:]_])(FAIL|ERROR)(ED|URE)?([^[:alnum:]_]|$)|Traceback \(most recent call last\)|AssertionError/){f=i;break} if(!f)exit; last=""; for(j=f+1;j<=NR&&j<=f+60;j++) if(fr(L[j]))last=trim(L[j]); if(last!=""){print "Failure: "trim(L[f])"${TRACE_SEP}"last;exit} b=""; for(k=f-1;k>=1&&k>=f-60;k--) if(fr(L[k])){b=trim(L[k]);break} if(b!=""){print "Failure: "trim(L[f])"${TRACE_SEP}"b;exit} print "Failure: "trim(L[f]) }' "$1" | head -1`,
+	},
+	{
+		id: "rb-trace",
+		description:
+			"Ruby / Minitest: the `N) Error:` / `N) Failure:` header + its first `path:line:in 'fn'` frame (Ruby prints the raise site first, so the first is the deepest)",
+		suggestedType: "test",
+		// One awk pass. (1) The numbered Minitest error/failure header. (2) The first
+		// `path.rb:line:in ` frame after it. Ruby's backtrace is ordered from the
+		// raise point outward, so the first frame IS the deepest. Prints nothing when
+		// no header is found.
+		command: String.raw`awk 'function trim(s){gsub(/^[ \t]+|[ \t]+$/,"",s);return s} function fr(l){return l ~ /^[ \t]*[^ \t]+\.rb:[0-9]+:in /} {L[NR]=$0} END{ for(i=1;i<=NR;i++) if(L[i] ~ /^[ \t]*[0-9]+\)[ \t]*(Error|Failure):/){f=i;break} if(!f)exit; for(j=f+1;j<=NR&&j<=f+60;j++) if(fr(L[j])){print "Failure: "trim(L[f])"${TRACE_SEP}"trim(L[j]);exit} print "Failure: "trim(L[f]) }' "$1" | head -1`,
+	},
+];
+
+export const DIGEST_PRESET_IDS = DIGEST_PRESETS.map((p) => p.id);
+
+/**
+ * Matchers selecting which jobs a digest entry applies to. Both are glob
+ * patterns tested against the bgrun job's `name` (optional) and command line
+ * respectively. `*` matches any run of characters (including none) and `?`
+ * matches exactly one UTF-16 code unit; everything else is literal, and `\`
+ * escapes the next character so `\*` / `\?` / `\\` match literally. Matching
+ * is case-insensitive and **whole-string** (write `*text*` for a substring).
+ * An absent, empty, or blank `match` matches every job.
+ */
+export interface DigestMatch {
+	name?: string;
+	command?: string;
+}
+
+/**
+ * One scorecard entry in the `digest` config: an optional job `type`, an
+ * optional `match`, an optional wake label, and either a shipped preset id or
+ * a custom sh command. Config normalizes to an ordered list of these; the
+ * first entry that matches a job wins (put the default entry last).
+ *
+ * `type` and `match` compose (AND): when both are present the entry matches
+ * only a job with that exact type that ALSO satisfies the glob `match`. Use
+ * `type` for a first-class job type declared at spawn time; use `match` alone
+ * as the fallback selector for jobs without a type. An entry with neither
+ * selector matches every job.
+ */
+export interface DigestEntry {
+	type?: string;
+	match?: DigestMatch;
+	label?: string;
+	preset?: string;
+	command?: string;
+	/**
+	 * When `"failure"`, the entry's output is appended ONLY for a job that exited
+	 * non-zero. The framework owns this check — a digest command receives only the
+	 * log path, never the exit code — so a green log that happens to contain an
+	 * `Error:` line cannot inject a failure into the wake. Absent means "always"
+	 * (the pre-existing behaviour).
+	 */
+	on?: "failure";
+}
+
+/**
+ * The job a digest entry is selected against at wake time. `type` is the
+ * job's agent-declared type (e.g. "test", "build"), matched exactly
+ * (case-insensitively) against type-gated entries before the glob fallback.
+ */
+export interface DigestJobTarget {
+	name?: string;
+	type?: string;
+	command: string;
+}
+
+/** A digest entry resolved against a concrete job. */
+export interface SelectedDigest {
+	command: string;
+	label: string;
+	/** Carried from the entry so the wake path can gate on the exit code. */
+	on?: "failure";
+}
+
+/**
+ * Resolve a normalized digest entry into the concrete sh command to run (the
+ * job's log path arrives as `$1`). When both `preset` and `command` are
+ * configured, the preset wins — a curated, shipped preset is preferred over a
+ * hand-rolled command pointing at the same format. Returns undefined when
+ * nothing usable is configured.
+ */
+export function resolveDigest(digest: { preset?: string; command?: string } | undefined): string | undefined {
+	if (!digest) return undefined;
+	if (digest.preset) {
+		const preset = DIGEST_PRESETS.find((p) => p.id === digest.preset);
+		if (preset) return preset.command;
+	}
+	if (digest.command) return digest.command;
+	return undefined;
+}
+
+/**
+ * Case-insensitive, whole-string glob match used by `match.name` /
+ * `match.command`. `*` matches any run of characters — including none, and
+ * including newlines so a multi-line command still matches — and `?` matches
+ * exactly one character. Every other character is literal. The pattern is
+ * escaped into a regex here, so no user text can become a regex metacharacter
+ * or quantifier: there is no backtracking hazard (ReDoS) and no anchoring
+ * ambiguity — the match is always against the whole string.
+ */
+function globMatches(pattern: string, text: string): boolean {
+	let re = "^";
+	for (let i = 0; i < pattern.length; i++) {
+		const ch = pattern[i];
+		// `\` escapes the next character, so `\*` / `\?` / `\\` match literally.
+		if (ch === "\\" && i + 1 < pattern.length) {
+			re += escapeRegexChar(pattern[++i]);
+		} else if (ch === "*") {
+			re += "[\\s\\S]*";
+		} else if (ch === "?") {
+			re += "[\\s\\S]";
+		} else {
+			re += escapeRegexChar(ch);
+		}
+	}
+	re += "$";
+	return new RegExp(re, "i").test(text);
+}
+
+/** Escape one literal character for a RegExp, so it can never be a metacharacter. */
+function escapeRegexChar(ch: string): string {
+	return ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Does a digest entry's glob `match` apply to this job? No `match` (or an
+ * empty one) matches every job. A present `name`/`command` pattern must
+ * match; `name` against a job with no name never matches. When both fields are
+ * present both must match (AND). Matching is **whole-string** and
+ * **case-insensitive** — so `"*unit*"` matches `"unit-tests-run3"`, while a
+ * bare `"unit-tests"` matches only exactly that. This helper handles the glob
+ * matcher only; `selectDigestEntry` composes it with the entry's `type` gate
+ * (both must match).
+ */
+export function entryMatchesJob(entry: DigestEntry, target: DigestJobTarget): boolean {
+	const match = entry.match;
+	if (!match) return true;
+	if (match.name === undefined && match.command === undefined) return true;
+	if (match.name !== undefined) {
+		if (target.name === undefined) return false;
+		if (!globMatches(match.name, target.name)) return false;
+	}
+	if (match.command !== undefined) {
+		if (!globMatches(match.command, target.command)) return false;
+	}
+	return true;
+}
+
+/** Terminal label when an entry sets neither `label` nor a `match.name`. */
+function defaultDigestLabel(entry: DigestEntry): string {
+	return entry.preset ?? "command";
+}
+
+/**
+ * Wake label derived from a glob pattern: drop the (unescaped) wildcards,
+ * unwrap escapes, so `*cargo*` → `cargo` and `e2e-\*` → `e2e-*`.
+ */
+function labelFromMatchName(pattern: string): string {
+	let out = "";
+	for (let i = 0; i < pattern.length; i++) {
+		const ch = pattern[i];
+		if (ch === "\\" && i + 1 < pattern.length) out += pattern[++i];
+		else if (ch === "*" || ch === "?") continue;
+		else out += ch;
+	}
+	return out.trim();
+}
+
+/**
+ * The distinct `type` values a digest config declares, in config order. Empty
+ * when no entry is typed. Single-sourced because three surfaces report the same
+ * vocabulary — the no-match log line, the wake note, and bgrun's spawn hint —
+ * and they must never disagree about what the project offers.
+ */
+export function digestTypes(entries: readonly DigestEntry[]): string[] {
+	return [...new Set(entries.map((e) => e.type).filter((t): t is string => typeof t === "string"))];
+}
+
+/**
+ * The no-match diagnostic's shared facts: how the job was identified and which
+ * types the config declares. Both the log line and the wake note are built from
+ * these, so the two can never describe different things.
+ */
+function digestNoMatchParts(target: DigestJobTarget, entries: DigestEntry[]): { job: string; types: string } {
+	const declaredTypes = digestTypes(entries);
+	const job =
+		target.type === undefined
+			? target.name === undefined
+				? "a job with no type or name"
+				: `job name "${target.name}"`
+			: `job type "${target.type}"`;
+	const types = declaredTypes.length ? ` — configured types: ${declaredTypes.join(", ")}` : "";
+	return { job, types };
+}
+
+/**
+ * One-line diagnostic for the silent no-digest case: a digest IS configured
+ * but no entry selected for this job. The usual causes are a `type` the agent
+ * never passes (or spells differently) and a `match` glob that never fires.
+ * Pure — the wake path decides whether to log it.
+ */
+export function digestNoMatchWarning(target: DigestJobTarget, entries: DigestEntry[]): string {
+	const { job, types } = digestNoMatchParts(target, entries);
+	return `[pi-bgrun] digest configured but selected no entry for ${job}${types}`;
+}
+
+/**
+ * Agent-facing form of the same diagnostic, for the wake message. oh-my-pi
+ * routes `pi.logger` output to a file the *agent* never reads, so a bare log
+ * line would leave a mismatched `type` invisible to the only party that can fix
+ * it. Phrased as an instruction rather than a log line; the wake path emits it
+ * at most once per distinct mismatch (see DIGEST_NO_MATCH_WARN_CAP).
+ */
+export function digestNoMatchWakeLine(target: DigestJobTarget, entries: DigestEntry[]): string {
+	const { job, types } = digestNoMatchParts(target, entries);
+	return (
+		`digest: no scorecard selected for ${job}${types} — ` +
+		"pass the matching `type` on the next bgrun call to get one"
+	);
+}
+
+/**
+ * Select the digest entry for a job and resolve it to a concrete command +
+ * wake label. Selection order:
+ *
+ *   1. Type entries first: an entry declaring `type` is eligible only for a
+ *      job declaring that same type (exact, case-insensitive) AND satisfying
+ *      the entry's `match` when it has one — `type` and `match` compose (AND).
+ *      Checked in config order, ahead of every match entry regardless of where
+ *      it sits in the list. First match wins.
+ *   2. Fallback: ordered scan over entries WITHOUT a `type` — `match.name` /
+ *      `match.command` globs (case-insensitive, whole-string) and no-`match`
+ *      defaults. First match wins. Jobs with no type therefore behave exactly
+ *      as before.
+ *   3. Nothing matched → undefined (no digest).
+ *
+ * Label precedence: entry `label` → (type entry) the type string → (match
+ * entry) the matched `match.name` → the entry's preset id (or "command"), so a
+ * bare preset entry labels the wake `digest (go-test):` instead of the old
+ * opaque "project-config". Returns undefined when the list is empty.
+ */
+export function selectDigestEntry(
+	entries: DigestEntry[] | undefined,
+	target: DigestJobTarget,
+): SelectedDigest | undefined {
+	if (!entries) return undefined;
+
+	// First entry (in the given order) whose `match` passes and which resolves to
+	// a command. Shared by the type-first pass and the fallback pass so the
+	// matching/resolution rules can never drift between them.
+	const pick = (candidates: DigestEntry[]): { entry: DigestEntry; command: string } | undefined => {
+		for (const entry of candidates) {
+			if (!entryMatchesJob(entry, target)) continue;
+			const command = resolveDigest(entry);
+			if (command) return { entry, command };
+		}
+		return undefined;
+	};
+
+	// 1. Type-first selection. Only entries declaring a type are eligible here,
+	// and only when the job declared one. A `match` on the entry, if any, must
+	// also pass. Config order decides ties.
+	if (target.type !== undefined) {
+		const want = target.type.toLowerCase();
+		const hit = pick(entries.filter((e) => e.type?.toLowerCase() === want));
+		// A type-matching entry always carries a non-empty type, so `entry.type` is
+		// the label fallback — no need for the preset-id default here.
+		if (hit?.entry.type) {
+			const out: SelectedDigest = {
+				command: hit.command,
+				label: hit.entry.label || hit.entry.type,
+			};
+			if (hit.entry.on) out.on = hit.entry.on;
+			return out;
+		}
+	}
+
+	// 2. Glob/default fallback over entries without a type.
+	const hit = pick(entries.filter((e) => !e.type));
+	if (hit) {
+		const entry = hit.entry;
+		const matchLabel = entry.match?.name === undefined ? "" : labelFromMatchName(entry.match.name);
+		const out: SelectedDigest = {
+			command: hit.command,
+			label: entry.label || matchLabel || defaultDigestLabel(entry),
+		};
+		if (entry.on) out.on = entry.on;
+		return out;
+	}
+	return undefined;
+}
