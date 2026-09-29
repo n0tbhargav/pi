@@ -5,6 +5,7 @@ import { getModel } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { encodeSessionDirName } from "../src/utils/session-dir-name.ts";
 
 describe("createAgentSession session manager defaults", () => {
 	let tempDir: string;
@@ -35,7 +36,7 @@ describe("createAgentSession session manager defaults", () => {
 			model: model!,
 		});
 
-		const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+		const safePath = encodeSessionDirName(cwd);
 		const expectedSessionDir = join(agentDir, "sessions", safePath);
 		const sessionDir = session.sessionManager.getSessionDir();
 		const sessionFile = session.sessionManager.getSessionFile();
