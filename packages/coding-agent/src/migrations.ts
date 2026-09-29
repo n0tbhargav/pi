@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, w
 import { dirname, join } from "path";
 import { CONFIG_DIR_NAME, getAgentDir, getBinDir } from "./config.ts";
 import { migrateKeybindingsConfig } from "./core/keybindings.ts";
+import { encodeSessionDirName } from "./utils/session-dir-name.ts";
 import { stripBom } from "./utils/text.ts";
 
 const MIGRATION_GUIDE_URL =
@@ -109,7 +110,7 @@ export function migrateSessionsFromAgentRoot(): void {
 			const cwd: string = header.cwd;
 
 			// Compute the correct session directory (same encoding as session-manager.ts)
-			const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+			const safePath = encodeSessionDirName(cwd);
 			const correctDir = join(agentDir, "sessions", safePath);
 
 			// Create directory if needed
