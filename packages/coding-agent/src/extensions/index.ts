@@ -1,10 +1,12 @@
 import type { InlineExtension } from "../core/extensions/types.ts";
+import backgroundRunExtension from "./background-run/index.ts";
 import codemodeExtension from "./codemode/index.ts";
 import llamaExtension from "./llama/index.ts";
 import mcpExtension from "./mcp/index.ts";
 import toolSearchExtension from "./tool-search/index.ts";
 
 export const builtInExtensions: InlineExtension[] = [
+	{ name: "background-run", factory: backgroundRunExtension, builtin: true },
 	{ name: "llama.cpp", factory: llamaExtension, builtin: true },
 	// Replaceable: an extension that registers `codemode`, `tool_search`, or `/mcp` (such as a third-party
 	// MCP extension) takes over instead of running alongside the built-in one.
