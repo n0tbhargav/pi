@@ -31,6 +31,7 @@ import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { encodeSessionDirName } from "../utils/session-dir-name.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -589,7 +590,7 @@ export function buildSessionContext(
 function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgentDir()): string {
 	const resolvedCwd = resolvePath(cwd);
 	const resolvedAgentDir = resolvePath(agentDir);
-	const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+	const safePath = encodeSessionDirName(resolvedCwd);
 	return join(resolvedAgentDir, "sessions", safePath);
 }
 
